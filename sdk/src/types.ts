@@ -281,12 +281,39 @@ export interface NetworkConfig {
   network: 'testnet' | 'mainnet' | 'futurenet';
   horizonUrl: string;
   sorobanRpcUrl: string;
+  /**
+   * Deployed contract IDs (C-strings) for the engine contracts.
+   *
+   * These are plain strings rather than `stellar-sdk` `Address` instances:
+   * `new Contract(id)` accepts a string, `Contract.fromAddress` is not used
+   * here, and an unconfigured deployment legitimately has no ID yet. Clients
+   * treat an empty string as "not configured" instead of constructing a
+   * placeholder `Address`, which is what previously forced callers to cast
+   * their config with `as NetworkConfig`.
+   */
   contracts: {
-    yieldEngine: Address;
-    rewardDistributor: Address;
-    rebalanceEngine: Address;
-    strategyRegistry: Address;
+    yieldEngine: string;
+    rewardDistributor: string;
+    rebalanceEngine: string;
+    strategyRegistry: string;
   };
+}
+
+/**
+ * Async wallet signer, e.g. a Freighter-backed signer.
+ *
+ * Passed anywhere the SDK accepts `Keypair | TransactionSigner`. The SDK
+ * detects the shape by the presence of `signTransaction`, so a `Keypair`
+ * never has to implement this interface.
+ */
+export interface TransactionSigner {
+  /** Resolve the signer's account address. */
+  getPublicKey(): Promise<string>;
+  /** Sign `transaction` for `networkPassphrase` and return the signed tx. */
+  signTransaction(
+    transaction: Transaction,
+    networkPassphrase: string
+  ): Promise<Transaction>;
 }
 
 export type VaultClientConfig = Pick<NetworkConfig, 'network' | 'sorobanRpcUrl'>;

@@ -7,38 +7,18 @@ import { Label } from '@/components/ui/label';
 import { Shield, Zap, Target, TrendingUp, AlertTriangle, CheckCircle } from 'lucide-react';
 import { YieldStrategy, RiskLevel } from 'stellar-liquidity-yield-engine-sdk';
 import { StrategyRegistryClient } from 'stellar-liquidity-yield-engine-sdk';
+import { getNetworkConfig, type UiNetwork } from '../config/network';
 
 interface StrategySelectorProps {
   onStrategySelect?: (strategy: YieldStrategy) => void;
   selectedStrategy?: YieldStrategy | null;
-  network?: 'testnet' | 'mainnet';
-}
-
-/** Build a minimal NetworkConfig for the registry client from a network string. */
-function networkConfigFor(network: 'testnet' | 'mainnet') {
-  return {
-    network,
-    horizonUrl:
-      network === 'mainnet'
-        ? 'https://horizon.stellar.org'
-        : 'https://horizon-testnet.stellar.org',
-    sorobanRpcUrl:
-      network === 'mainnet'
-        ? 'https://soroban.stellar.org'
-        : 'https://soroban-testnet.stellar.org',
-    contracts: {
-      yieldEngine: '',
-      rewardDistributor: '',
-      rebalanceEngine: '',
-      strategyRegistry: '',
-    },
-  };
+  network?: UiNetwork;
 }
 
 export const StrategySelector: React.FC<StrategySelectorProps> = ({
   onStrategySelect,
   selectedStrategy,
-  network = 'testnet'
+  network
 }) => {
   const [strategies, setStrategies] = useState<YieldStrategy[]>([]);
   const [loading, setLoading] = useState(true);
@@ -61,7 +41,7 @@ export const StrategySelector: React.FC<StrategySelectorProps> = ({
       setLoading(true);
       setError(null);
 
-      const registryClient = new StrategyRegistryClient(networkConfigFor(network));
+      const registryClient = new StrategyRegistryClient(getNetworkConfig(network));
       const activeStrategies = await registryClient.fetchActiveStrategies();
       setStrategies(activeStrategies);
     } catch (err: any) {

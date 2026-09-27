@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useMemo } from 'react';
+﻿import React, { useState, useEffect, useMemo } from 'react';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -14,8 +14,9 @@ import {
   AlertCircle,
   Loader2
 } from 'lucide-react';
-import { RebalancerClient, RebalanceStrategy, RebalanceHistory, PoolAllocation, RebalanceProposal, NetworkConfig } from 'stellar-liquidity-yield-engine-sdk';
+import { RebalancerClient, RebalanceStrategy, RebalanceHistory, PoolAllocation, RebalanceProposal } from 'stellar-liquidity-yield-engine-sdk';
 import { useTxStatus } from '../hooks/useTxStatus';
+import { getNetworkConfig, type UiNetwork } from '../config/network';
 import {
   createFreighterSigner,
   isFreighterAvailable,
@@ -23,32 +24,11 @@ import {
 } from '../lib/freighter';
 
 interface RebalancePanelProps {
-  network?: 'testnet' | 'mainnet';
-}
-
-/** Build a minimal `NetworkConfig` from a network string. */
-function networkConfigFor(network: 'testnet' | 'mainnet'): NetworkConfig {
-  return {
-    network,
-    horizonUrl:
-      network === 'mainnet'
-        ? 'https://horizon.stellar.org'
-        : 'https://horizon-testnet.stellar.org',
-    sorobanRpcUrl:
-      network === 'mainnet'
-        ? 'https://soroban.stellar.org'
-        : 'https://soroban-testnet.stellar.org',
-    contracts: {
-      yieldEngine: '',
-      rewardDistributor: '',
-      rebalanceEngine: '',
-      strategyRegistry: '',
-    },
-  } as NetworkConfig;
+  network?: UiNetwork;
 }
 
 export const RebalancePanel: React.FC<RebalancePanelProps> = ({
-  network = 'testnet'
+  network
 }) => {
   const [strategies, setStrategies] = useState<RebalanceStrategy[]>([]);
   const [history, setHistory] = useState<RebalanceHistory[]>([]);
@@ -60,15 +40,19 @@ export const RebalancePanel: React.FC<RebalancePanelProps> = ({
 
   const { txStatus, txHash, txError, runTx, resetTx } = useTxStatus();
 
-  // Fix: RebalancerClient takes NetworkConfig, not a plain string.
+  // Endpoints and contract IDs come from the environment (issue #101);
+  // `undefined` means "use the configured network".
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
+  const activeNetwork = networkConfig.network;
+
   const rebalancerClient = useMemo(
-    () => new RebalancerClient(networkConfigFor(network)),
-    [network]
+    () => new RebalancerClient(networkConfig),
+    [networkConfig]
   );
 
   useEffect(() => {
     loadData();
-  }, [network]);
+  }, [networkConfig]);
 
   const loadData = async () => {
     try {
@@ -132,7 +116,7 @@ export const RebalancePanel: React.FC<RebalancePanelProps> = ({
       // Sign through the wallet: Freighter provides the public key and signs
       // the built transaction, so `execute_rebalance` runs against the user's
       // real account instead of a mock placeholder.
-      const signer = createFreighterSigner(network);
+      const signer = createFreighterSigner(activeNetwork);
       const result = await rebalancerClient.executeRebalance(signer, proposal);
       await loadData();
       return {
@@ -390,7 +374,7 @@ export const RebalancePanel: React.FC<RebalancePanelProps> = ({
                             ${Number(record.amountMoved).toLocaleString()}
                           </div>
                           <div className="text-sm text-gray-500">
-                            {record.apyBefore / 100}% → {record.apyAfter / 100}%
+                            {record.apyBefore / 100}% â†’ {record.apyAfter / 100}%
                           </div>
                         </div>
                       </div>
@@ -423,15 +407,15 @@ export const RebalancePanel: React.FC<RebalancePanelProps> = ({
               )}
 
               <span className="font-medium">
-                {txStatus === 'submitting' && 'Submitting rebalance transaction…'}
-                {txStatus === 'pending' && 'Waiting for confirmation…'}
+                {txStatus === 'submitting' && 'Submitting rebalance transactionâ€¦'}
+                {txStatus === 'pending' && 'Waiting for confirmationâ€¦'}
                 {txStatus === 'confirmed' && 'Rebalance confirmed'}
                 {txStatus === 'failed' && (txError ?? 'Rebalance failed')}
               </span>
 
               {txHash && (
                 <span className="ml-auto font-mono text-xs truncate max-w-[160px]" title={txHash}>
-                  {txHash.slice(0, 8)}…{txHash.slice(-6)}
+                  {txHash.slice(0, 8)}â€¦{txHash.slice(-6)}
                 </span>
               )}
 

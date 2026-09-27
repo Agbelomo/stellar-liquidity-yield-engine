@@ -1,16 +1,30 @@
-/**
+﻿/**
  * StakingModal Component
  * 
  * Modal for locking governance tokens to earn voting power and boosted yields.
  */
 
 import React, { useState, useMemo, useEffect } from 'react';
-import { LockInfo, formatVotingPower, formatDuration, calculateBoostMultiplier } from '../../sdk/src/governance';
+import type { LockInfo } from '../../sdk/src/governance';
+import {
+  formatVotingPower,
+  formatAmount,
+  formatDuration,
+  parseStroops,
+  calculateBoostMultiplier,
+  DEFAULT_TOKEN_DECIMALS,
+} from '../../sdk/src/governance';
 
 interface StakingModalProps {
   isOpen: boolean;
   onClose: () => void;
   tokenBalance: bigint;
+  /**
+   * Decimals of the governance token (7 for a Stellar Asset Contract token,
+   * 18 for some LP tokens). Issue #103: amounts must never be formatted by
+   * assuming 7, or they render off by orders of magnitude.
+   */
+  tokenDecimals?: number;
   lockInfo?: LockInfo;
   onCreateLock: (amount: bigint, duration: number) => Promise<void>;
   onIncreaseLock: (amount: bigint) => Promise<void>;
@@ -23,6 +37,7 @@ const StakingModal: React.FC<StakingModalProps> = ({
   isOpen,
   onClose,
   tokenBalance,
+  tokenDecimals = DEFAULT_TOKEN_DECIMALS,
   lockInfo,
   onCreateLock,
   onIncreaseLock,
@@ -40,16 +55,20 @@ const StakingModal: React.FC<StakingModalProps> = ({
     return calculateBoostMultiplier(duration);
   }, [duration]);
 
+  // Amount as typed, in base units. Parsed as an exact decimal string, never
+  // through parseFloat/Number (issue #103).
+  const parsedAmount = useMemo(
+    () => parseStroops(amount, tokenDecimals),
+    [amount, tokenDecimals]
+  );
+
   // Calculate voting power for given amount and duration
   const estimatedVotingPower = useMemo(() => {
-    const amountNum = parseFloat(amount) * 1e7 || 0; // 7 decimals
-    if (amountNum <= 0) return BigInt(0);
-    
+    if (parsedAmount <= 0n) return BigInt(0);
+
     const maxDuration = 4 * 365 * 24 * 60 * 60;
-    const remainingTime = duration;
-    const power = BigInt(Math.floor(amountNum)) * BigInt(remainingTime) / BigInt(maxDuration);
-    return power;
-  }, [amount, duration]);
+    return parsedAmount * BigInt(duration) / BigInt(maxDuration);
+  }, [parsedAmount, duration]);
 
   // Duration options
   const durationOptions = [
@@ -75,18 +94,25 @@ const StakingModal: React.FC<StakingModalProps> = ({
     }
   };
 
+  // Exact decimal string for the user's full balance, used by the "Max"
+  // button and its label. No float round-trip, so the inserted value always
+  // parses back to `tokenBalance` exactly.
+  const maxAmountLabel = useMemo(
+    () => formatAmount(tokenBalance, tokenDecimals),
+    [tokenBalance, tokenDecimals]
+  );
+
   // Set max amount
   const setMaxAmount = () => {
-    const balanceNum = Number(tokenBalance) / 1e7;
-    setAmount(balanceNum.toFixed(7).replace(/\.?0+$/, ''));
+    setAmount(maxAmountLabel);
   };
 
   // Handle submit
   const handleSubmit = async () => {
     setIsSubmitting(true);
     try {
-      const amountBigInt = BigInt(Math.floor(parseFloat(amount) * 1e7));
-      
+      const amountBigInt = parsedAmount;
+
       switch (activeTab) {
         case 'create':
           await onCreateLock(amountBigInt, duration);
@@ -101,7 +127,7 @@ const StakingModal: React.FC<StakingModalProps> = ({
           await onWithdraw();
           break;
       }
-      
+
       // Reset form on success
       setAmount('');
     } finally {
@@ -111,21 +137,19 @@ const StakingModal: React.FC<StakingModalProps> = ({
 
   // Check if form is valid
   const isFormValid = useMemo(() => {
-    const amountNum = parseFloat(amount) * 1e7;
-    
     switch (activeTab) {
       case 'create':
-        return amountNum > 0 && amountNum <= Number(tokenBalance);
+        return parsedAmount > 0n && parsedAmount <= tokenBalance;
       case 'increase':
-        return amountNum > 0 && amountNum <= Number(tokenBalance);
+        return parsedAmount > 0n && parsedAmount <= tokenBalance;
       case 'extend':
         return duration > 0;
       case 'withdraw':
-        return lockInfo && lockInfo.endTime * 1000 <= Date.now();
+        return Boolean(lockInfo && lockInfo.endTime * 1000 <= Date.now());
       default:
         return false;
     }
-  }, [activeTab, amount, duration, tokenBalance, lockInfo]);
+  }, [activeTab, parsedAmount, duration, tokenBalance, lockInfo]);
 
   // Time until lock expiry
   const timeUntilExpiry = useMemo(() => {
@@ -272,7 +296,7 @@ const StakingModal: React.FC<StakingModalProps> = ({
                       onClick={setMaxAmount}
                       className="text-xs text-purple-600 hover:text-purple-700"
                     >
-                      Max: {Number(tokenBalance) / 1e7}
+                      Max: {maxAmountLabel}
                     </button>
                   </div>
                   <div className="relative">
@@ -362,7 +386,7 @@ const StakingModal: React.FC<StakingModalProps> = ({
                       onClick={setMaxAmount}
                       className="text-xs text-purple-600 hover:text-purple-700"
                     >
-                      Max: {Number(tokenBalance) / 1e7}
+                      Max: {maxAmountLabel}
                     </button>
                   </div>
                   <div className="relative">
@@ -388,7 +412,7 @@ const StakingModal: React.FC<StakingModalProps> = ({
                     <span className="text-gray-600">After Increase</span>
                     <span className="font-medium text-purple-600">
                       {formatVotingPower(
-                        lockInfo.amount + BigInt(Math.floor(parseFloat(amount || '0') * 1e7))
+                        lockInfo.amount + parsedAmount
                       )}
                     </span>
                   </div>
@@ -507,10 +531,10 @@ const StakingModal: React.FC<StakingModalProps> = ({
           <div className="bg-blue-50 rounded-lg p-4">
             <h4 className="text-sm font-semibold text-blue-900 mb-2">How Locking Works</h4>
             <ul className="text-xs text-blue-700 space-y-1">
-              <li>• Lock SYGT for up to 4 years to earn voting power</li>
-              <li>• Longer locks get higher boost multipliers (up to 2.5x)</li>
-              <li>• Boosted balances earn higher vault yields</li>
-              <li>• You cannot withdraw early - tokens are locked until expiry</li>
+              <li>â€¢ Lock SYGT for up to 4 years to earn voting power</li>
+              <li>â€¢ Longer locks get higher boost multipliers (up to 2.5x)</li>
+              <li>â€¢ Boosted balances earn higher vault yields</li>
+              <li>â€¢ You cannot withdraw early - tokens are locked until expiry</li>
             </ul>
           </div>
         </div>

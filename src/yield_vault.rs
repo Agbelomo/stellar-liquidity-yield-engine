@@ -42,6 +42,19 @@ pub struct YieldVault;
 /// Seconds in a common (non-leap) year, used to annualize APY.
 const SECONDS_PER_YEAR: u128 = 31_536_000;
 
+/// Default minimum deposit per leg: 0, because a single-leg deposit is a valid
+/// operation. The combined deposit must still be positive, and an admin can
+/// raise either leg with `set_min_deposit_amounts`.
+pub const DEFAULT_MIN_DEPOSIT: i128 = 0;
+
+/// Smallest accepted withdrawal, in shares, when the admin has not configured a
+/// minimum: one share.
+pub const DEFAULT_MIN_WITHDRAW_SHARES: i128 = 1;
+
+/// A tracked balance at or below this is dust. It is swept into a full exit
+/// instead of being stranded in the vault forever.
+pub const DUST_THRESHOLD: i128 = 1;
+
 #[contractimpl]
 impl YieldVault {
     /// Initialize a new yield vault
@@ -121,6 +134,13 @@ impl YieldVault {
     ) -> i128 {
         Self::require_not_paused(&env);
 
+        // Reject sub-unit and zero deposits before any tokens move, so a dust
+        // deposit can never be used to grief the vault or other depositors.
+        let (min_a, min_b) = Self::get_min_deposit_amounts(env.clone());
+        require!(amount_a >= min_a, "amount_a below minimum deposit");
+        require!(amount_b >= min_b, "amount_b below minimum deposit");
+        require!(amount_a + amount_b > 0, "deposit must be positive");
+
         let vault_info = Self::get_vault_info(env.clone());
         let mut metrics = Self::get_metrics(env.clone());
 
@@ -144,6 +164,10 @@ impl YieldVault {
                 (amount_a + amount_b) * metrics.total_shares / total_value
             }
         };
+
+        // A deposit that rounds down to nothing would be a pure donation, so it
+        // is rejected instead of silently credited to existing holders.
+        require!(shares > 0, "deposit too small: mints zero shares");
 
         if shares < min_shares {
             panic!("insufficient shares received");
@@ -183,6 +207,15 @@ impl YieldVault {
     ) -> (i128, i128) {
         Self::require_not_paused(&env);
 
+        // Reject zero-share and sub-unit withdrawals before any arithmetic, which
+        // also removes the divide-by-zero path when no shares are outstanding.
+        let min_withdraw_shares = Self::get_min_withdraw_shares(env.clone());
+        require!(shares > 0, "shares must be positive");
+        require!(
+            shares >= min_withdraw_shares,
+            "withdrawal below minimum shares"
+        );
+
         let vault_info = Self::get_vault_info(env.clone());
         let mut metrics = Self::get_metrics(env.clone());
         let mut position = Self::get_user_position(env.clone(), user.clone());
@@ -191,9 +224,32 @@ impl YieldVault {
             panic!("insufficient shares");
         }
 
+        require!(metrics.total_shares > 0, "no shares outstanding");
+
         // Calculate withdrawal amounts
-        let withdraw_amount_a = shares * metrics.total_amount_a / metrics.total_shares;
-        let withdraw_amount_b = shares * metrics.total_amount_b / metrics.total_shares;
+        let is_full_exit = shares == position.shares;
+        let mut withdraw_amount_a = shares * metrics.total_amount_a / metrics.total_shares;
+        let mut withdraw_amount_b = shares * metrics.total_amount_b / metrics.total_shares;
+
+        if is_full_exit {
+            // Sweep a dust remainder into the exit so a rounding leftover can
+            // never be stranded in the vault and can never block a full exit.
+            let leftover_a = metrics.total_amount_a - withdraw_amount_a;
+            if leftover_a <= DUST_THRESHOLD {
+                withdraw_amount_a += leftover_a;
+            }
+            let leftover_b = metrics.total_amount_b - withdraw_amount_b;
+            if leftover_b <= DUST_THRESHOLD {
+                withdraw_amount_b += leftover_b;
+            }
+        } else {
+            // A partial exit has to redeem something, otherwise the shares would
+            // round-trip to dust.
+            require!(
+                withdraw_amount_a > 0 || withdraw_amount_b > 0,
+                "withdrawal too small: redeems zero tokens"
+            );
+        }
 
         // Apply withdrawal fee
         let fee_amount_a = withdraw_amount_a * vault_info.withdrawal_fee as i128 / 10000;
@@ -341,6 +397,65 @@ impl YieldVault {
                 (_caller, net_rewards_a, net_rewards_b, fee_a, fee_b),
             );
         }
+    }
+
+    /// Minimum accepted deposit amounts as `(min_amount_a, min_amount_b)`
+    pub fn get_min_deposit_amounts(env: Env) -> (i128, i128) {
+        (
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "min_deposit_a"))
+                .unwrap_or(DEFAULT_MIN_DEPOSIT),
+            env.storage()
+                .instance()
+                .get(&Symbol::new(&env, "min_deposit_b"))
+                .unwrap_or(DEFAULT_MIN_DEPOSIT),
+        )
+    }
+
+    /// Set the minimum accepted deposit per leg (admin only). A minimum of 0
+    /// keeps single-leg deposits open; the combined deposit must be positive
+    /// either way.
+    pub fn set_min_deposit_amounts(env: Env, admin: Address, min_a: i128, min_b: i128) {
+        Self::require_admin(&env, admin.clone());
+        require!(min_a >= 0, "min_amount_a must not be negative");
+        require!(min_b >= 0, "min_amount_b must not be negative");
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "min_deposit_a"), &min_a);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "min_deposit_b"), &min_b);
+
+        env.events().publish(
+            (Symbol::new(&env, "min_deposit_updated"),),
+            (admin, min_a, min_b),
+        );
+    }
+
+    /// Smallest accepted withdrawal, in shares
+    pub fn get_min_withdraw_shares(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "min_withdraw_shares"))
+            .unwrap_or(DEFAULT_MIN_WITHDRAW_SHARES)
+    }
+
+    /// Set the smallest accepted withdrawal in shares (admin only). Must be
+    /// positive so a zero-share withdrawal is always rejected.
+    pub fn set_min_withdraw_shares(env: Env, admin: Address, min_shares: i128) {
+        Self::require_admin(&env, admin.clone());
+        require!(min_shares > 0, "min_shares must be positive");
+
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "min_withdraw_shares"), &min_shares);
+
+        env.events().publish(
+            (Symbol::new(&env, "min_withdraw_shares_updated"),),
+            (admin, min_shares),
+        );
     }
 
     /// Get vault information

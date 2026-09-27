@@ -1,16 +1,17 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { VaultClient, VaultInfo, VaultMetrics, UserPosition, NetworkConfig } from 'stellar-liquidity-yield-engine-sdk';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { VaultClient, VaultInfo, VaultMetrics, UserPosition } from 'stellar-liquidity-yield-engine-sdk';
 import {
   createFreighterSigner,
   getFreighterPublicKey,
   isFreighterAvailable,
   isFreighterConnected,
 } from '../lib/freighter';
+import { getNetworkConfig, type UiNetwork } from '../config/network';
 
 interface UseYieldVaultOptions {
   vaultAddress: string;
   userAddress: string;
-  network?: 'testnet' | 'mainnet';
+  network?: UiNetwork;
   autoRefresh?: boolean;
   refreshInterval?: number;
 }
@@ -35,29 +36,13 @@ interface UseYieldVaultReturn {
   disconnect: () => void;
 }
 
-const networkConfigFor = (network: 'testnet' | 'mainnet'): NetworkConfig =>
-  ({
-    network,
-    horizonUrl:
-      network === 'mainnet'
-        ? 'https://horizon.stellar.org'
-        : 'https://horizon-testnet.stellar.org',
-    sorobanRpcUrl:
-      network === 'mainnet'
-        ? 'https://soroban.stellar.org'
-        : 'https://soroban-testnet.stellar.org',
-    contracts: {
-      yieldEngine: '',
-      rewardDistributor: '',
-      rebalanceEngine: '',
-      strategyRegistry: '',
-    },
-  } as NetworkConfig);
-
+// Network endpoints and contract IDs come from the environment via
+// `../config/network` (issue #101) instead of being hardcoded here. Defaults to
+// the configured network when the caller does not specify one.
 export const useYieldVault = ({
   vaultAddress,
   userAddress,
-  network = 'testnet',
+  network,
   autoRefresh = false,
   refreshInterval = 30000 // 30 seconds
 }: UseYieldVaultOptions): UseYieldVaultReturn => {
@@ -70,9 +55,13 @@ export const useYieldVault = ({
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
 
+  // `undefined` means "use the network from the environment".
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
+  const activeNetwork = networkConfig.network;
+
   const vaultClient = useMemo(
-    () => new VaultClient(vaultAddress, networkConfigFor(network)),
-    [vaultAddress, network]
+    () => new VaultClient(vaultAddress, networkConfig),
+    [vaultAddress, networkConfig]
   );
 
   // Use the Freighter address when connected, falling back to the prop.
@@ -159,7 +148,7 @@ export const useYieldVault = ({
       }
 
       // Sign and submit a real deposit transaction through Freighter.
-      const result = await vaultClient.deposit(createFreighterSigner(network), {
+      const result = await vaultClient.deposit(createFreighterSigner(activeNetwork), {
         amountA,
         amountB,
         minShares
@@ -173,7 +162,7 @@ export const useYieldVault = ({
       setError(err.message);
       throw err;
     }
-  }, [vaultClient, refresh, walletAddress, network]);
+  }, [vaultClient, refresh, walletAddress, activeNetwork]);
 
   const withdraw = useCallback(async (
     shares: bigint,
@@ -188,7 +177,7 @@ export const useYieldVault = ({
       }
 
       // Sign and submit a real withdrawal transaction through Freighter.
-      const result = await vaultClient.withdraw(createFreighterSigner(network), {
+      const result = await vaultClient.withdraw(createFreighterSigner(activeNetwork), {
         shares,
         minAmountA,
         minAmountB
@@ -202,7 +191,7 @@ export const useYieldVault = ({
       setError(err.message);
       throw err;
     }
-  }, [vaultClient, refresh, walletAddress, network]);
+  }, [vaultClient, refresh, walletAddress, activeNetwork]);
 
   const harvest = useCallback(async () => {
     try {
@@ -213,7 +202,7 @@ export const useYieldVault = ({
       }
 
       // Sign and submit a real harvest transaction through Freighter.
-      const result = await vaultClient.harvest(createFreighterSigner(network));
+      const result = await vaultClient.harvest(createFreighterSigner(activeNetwork));
 
       // Refresh data after successful harvest
       await refresh();
@@ -223,7 +212,7 @@ export const useYieldVault = ({
       setError(err.message);
       throw err;
     }
-  }, [vaultClient, refresh, walletAddress, network]);
+  }, [vaultClient, refresh, walletAddress, activeNetwork]);
 
   const getAPY = useCallback(async () => {
     try {
@@ -286,7 +275,7 @@ export const useYieldVault = ({
 interface UseMultipleVaultsOptions {
   vaultAddresses: string[];
   userAddress: string;
-  network?: 'testnet' | 'mainnet';
+  network?: UiNetwork;
   autoRefresh?: boolean;
   refreshInterval?: number;
 }
@@ -294,7 +283,7 @@ interface UseMultipleVaultsOptions {
 export const useMultipleVaults = ({
   vaultAddresses,
   userAddress,
-  network = 'testnet',
+  network,
   autoRefresh = false,
   refreshInterval = 30000
 }: UseMultipleVaultsOptions) => {
@@ -310,10 +299,13 @@ export const useMultipleVaults = ({
   const [overallLoading, setOverallLoading] = useState(true);
   const [overallError, setOverallError] = useState<string | null>(null);
 
+  // One config for every vault, so all of them hit the same RPC endpoint.
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
+
   const refreshVault = useCallback(async (vaultAddress: string) => {
     try {
-      const vaultClient = new VaultClient(vaultAddress, network);
-      
+      const vaultClient = new VaultClient(vaultAddress, networkConfig);
+
       const [info, metrics, position, paused] = await Promise.all([
         vaultClient.getVaultInfo(),
         vaultClient.getMetrics(),
@@ -339,7 +331,7 @@ export const useMultipleVaults = ({
         error: err.message
       })));
     }
-  }, [network, userAddress]);
+  }, [networkConfig, userAddress]);
 
   const refreshAll = useCallback(async () => {
     setOverallLoading(true);
@@ -419,7 +411,7 @@ export const useMultipleVaults = ({
 };
 
 // Hook for vault performance tracking
-export const useVaultPerformance = (vaultAddress: string, network: 'testnet' | 'mainnet' = 'testnet') => {
+export const useVaultPerformance = (vaultAddress: string, network?: UiNetwork) => {
   const [performanceData, setPerformanceData] = useState<{
     apyHistory: number[];
     tvlHistory: bigint[];
@@ -432,7 +424,14 @@ export const useVaultPerformance = (vaultAddress: string, network: 'testnet' | '
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const vaultClient = new VaultClient(vaultAddress, network);
+  // Memoized: an unmemoized client would build a new SorobanRpc.Server on
+  // every render, and would also be recreated between renders that only
+  // changed unrelated state.
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
+  const vaultClient = useMemo(
+    () => new VaultClient(vaultAddress, networkConfig),
+    [vaultAddress, networkConfig]
+  );
 
   const trackPerformance = useCallback(async () => {
     try {

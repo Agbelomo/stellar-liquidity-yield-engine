@@ -1,4 +1,4 @@
-/**
+﻿/**
  * Governance SDK Module
  * 
  * Provides JavaScript/TypeScript interface for the Stellar Yield Governance system.
@@ -16,10 +16,51 @@ import {
 } from 'stellar-sdk';
 
 // ===== Configuration =====
-const GOVERNANCE_CONTRACT_ADDRESS = process.env.GOVERNANCE_CONTRACT || 'GOV_TOKEN_CONTRACT_ADDRESS';
-const VOTING_ESCROW_CONTRACT_ADDRESS = process.env.VOTING_ESCROW_CONTRACT || 'VE_TOKEN_CONTRACT_ADDRESS';
-const STAKING_CONTRACT_ADDRESS = process.env.STAKING_CONTRACT || 'STAKING_CONTRACT_ADDRESS';
-const FEE_DISTRIBUTOR_CONTRACT_ADDRESS = process.env.FEE_DISTRIBUTOR_CONTRACT || 'FEE_DISTRIBUTOR_ADDRESS';
+
+/**
+ * Deployed contract IDs used by {@link GovernanceSDK}.
+ *
+ * Every field is optional; an unconfigured deployment simply leaves the
+ * corresponding calls unusable, which is surfaced as an explicit error rather
+ * than a fabricated placeholder address.
+ */
+export interface GovernanceContracts {
+  /** Governance token + proposal registry. */
+  governance: string;
+  /** Voting escrow (lock) contract. */
+  votingEscrow: string;
+  /** Staking / rewards contract. */
+  staking: string;
+  /** Fee distributor contract. */
+  feeDistributor: string;
+}
+
+/**
+ * Placeholder IDs reported when a contract has not been configured. These are
+ * deliberately not valid addresses so a misconfigured deployment fails loudly
+ * instead of silently targeting some other contract.
+ */
+const UNCONFIGURED_CONTRACT = 'UNCONFIGURED';
+
+/**
+ * Contract IDs read from the environment, used only as a fallback for callers
+ * that do not inject their own (e.g. Node scripts and the examples).
+ *
+ * Browser bundles cannot read server-side environment variables, so UI callers
+ * must pass `contracts` to the {@link GovernanceSDK} constructor instead.
+ */
+export const DEFAULT_GOVERNANCE_CONTRACTS: GovernanceContracts = {
+  governance: process.env.GOVERNANCE_CONTRACT || UNCONFIGURED_CONTRACT,
+  votingEscrow: process.env.VOTING_ESCROW_CONTRACT || UNCONFIGURED_CONTRACT,
+  staking: process.env.STAKING_CONTRACT || UNCONFIGURED_CONTRACT,
+  feeDistributor: process.env.FEE_DISTRIBUTOR_CONTRACT || UNCONFIGURED_CONTRACT,
+};
+
+/** True when `contractId` is a usable, explicitly configured contract ID. */
+export function isContractConfigured(contractId: string | undefined | null): boolean {
+  return typeof contractId === 'string' && contractId.length > 0 && contractId !== UNCONFIGURED_CONTRACT;
+}
+
 
 // ===== Type Definitions =====
 
@@ -80,6 +121,18 @@ export interface LockInfo {
 }
 
 /**
+ * Result of submitting a signed transaction.
+ */
+export interface SubmittedTransaction {
+  hash: string;
+  success: boolean;
+  /** Ledger the transaction was included in, once known. */
+  ledger?: number;
+  /** Why it did not succeed, when `success` is false. */
+  error?: string;
+}
+
+/**
  * Fee distribution info
  */
 export interface FeeDistribution {
@@ -107,15 +160,79 @@ export class GovernanceSDK {
   private server: SorobanRpc.Server;
   private networkPassphrase: string;
   private keypair?: Keypair;
+  private governanceContractId: string;
+  private votingEscrowContractId: string;
+  private stakingContractId: string;
+  private feeDistributorContractId: string;
 
+  /**
+   * @param sorobanRpcUrl Soroban RPC endpoint for the target network.
+   * @param networkPassphrase Network passphrase used to build and sign txs.
+   * @param keypair Optional signer. Read-only calls work without one.
+   * @param contracts Optional contract ID overrides. Anything omitted falls
+   *   back to `DEFAULT_GOVERNANCE_CONTRACTS` (environment-driven). Browser
+   *   callers must pass these explicitly since they cannot read `process.env`.
+   */
   constructor(
     sorobanRpcUrl: string,
     networkPassphrase: string,
-    keypair?: Keypair
+    keypair?: Keypair,
+    contracts: Partial<GovernanceContracts> = {}
   ) {
     this.server = new SorobanRpc.Server(sorobanRpcUrl);
     this.networkPassphrase = networkPassphrase;
     this.keypair = keypair;
+    this.governanceContractId = contracts.governance || DEFAULT_GOVERNANCE_CONTRACTS.governance;
+    this.votingEscrowContractId = contracts.votingEscrow || DEFAULT_GOVERNANCE_CONTRACTS.votingEscrow;
+    this.stakingContractId = contracts.staking || DEFAULT_GOVERNANCE_CONTRACTS.staking;
+    this.feeDistributorContractId = contracts.feeDistributor || DEFAULT_GOVERNANCE_CONTRACTS.feeDistributor;
+  }
+
+  /**
+   * Contract IDs this client is pointed at. Useful for diagnostics and for
+   * callers that need to confirm a deployment is fully configured.
+   */
+  getContracts(): GovernanceContracts {
+    return {
+      governance: this.governanceContractId,
+      votingEscrow: this.votingEscrowContractId,
+      staking: this.stakingContractId,
+      feeDistributor: this.feeDistributorContractId,
+    };
+  }
+
+  // Validating accessors. Every call site reads the contract through these so
+  // an unconfigured deployment fails with an actionable message instead of
+  // constructing a `Contract` from a placeholder ID.
+  private get governanceContract(): string {
+    return this.requireContract(this.governanceContractId, 'governance');
+  }
+
+  private get votingEscrowContract(): string {
+    return this.requireContract(this.votingEscrowContractId, 'votingEscrow');
+  }
+
+  private get stakingContract(): string {
+    return this.requireContract(this.stakingContractId, 'staking');
+  }
+
+  private get feeDistributorContract(): string {
+    return this.requireContract(this.feeDistributorContractId, 'feeDistributor');
+  }
+
+  /**
+   * Resolve a contract ID, failing with an actionable message when the
+   * deployment has not been configured for it.
+   */
+  private requireContract(contractId: string, role: keyof GovernanceContracts): string {
+    if (!isContractConfigured(contractId)) {
+      throw new Error(
+        `Governance contract "${role}" is not configured. ` +
+          `Pass contracts.${role} to the GovernanceSDK constructor (browser) ` +
+          `or set the matching environment variable (Node).`
+      );
+    }
+    return contractId;
   }
 
   /**
@@ -147,7 +264,7 @@ export class GovernanceSDK {
   async getTokenBalance(address: string): Promise<bigint> {
     try {
       const result = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'balance',
         { addr: address }
       );
@@ -164,7 +281,7 @@ export class GovernanceSDK {
   async getTotalSupply(): Promise<bigint> {
     try {
       const result = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'total_supply',
         {}
       );
@@ -184,7 +301,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'transfer',
       {
         from: this.keypair.publicKey(),
@@ -205,7 +322,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'delegate',
       {
         from: this.keypair.publicKey(),
@@ -237,7 +354,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      VOTING_ESCROW_CONTRACT_ADDRESS,
+      this.votingEscrowContract,
       'create_lock',
       {
         user: this.keypair.publicKey(),
@@ -258,7 +375,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      VOTING_ESCROW_CONTRACT_ADDRESS,
+      this.votingEscrowContract,
       'increase_lock',
       {
         user: this.keypair.publicKey(),
@@ -278,7 +395,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      VOTING_ESCROW_CONTRACT_ADDRESS,
+      this.votingEscrowContract,
       'extend_lock',
       {
         user: this.keypair.publicKey(),
@@ -298,7 +415,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      VOTING_ESCROW_CONTRACT_ADDRESS,
+      this.votingEscrowContract,
       'withdraw',
       {
         user: this.keypair.publicKey()
@@ -319,7 +436,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        VOTING_ESCROW_CONTRACT_ADDRESS,
+        this.votingEscrowContract,
         'get_voting_power',
         { user: addr }
       );
@@ -341,7 +458,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        VOTING_ESCROW_CONTRACT_ADDRESS,
+        this.votingEscrowContract,
         'get_boosted_balance',
         { user: addr }
       );
@@ -363,7 +480,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        VOTING_ESCROW_CONTRACT_ADDRESS,
+        this.votingEscrowContract,
         'get_boost_multiplier',
         { user: addr }
       );
@@ -385,7 +502,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        VOTING_ESCROW_CONTRACT_ADDRESS,
+        this.votingEscrowContract,
         'get_lock_info',
         { user: addr }
       );
@@ -418,7 +535,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      VOTING_ESCROW_CONTRACT_ADDRESS,
+      this.votingEscrowContract,
       'delegate',
       {
         from: this.keypair.publicKey(),
@@ -441,7 +558,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      STAKING_CONTRACT_ADDRESS,
+      this.stakingContract,
       'stake',
       {
         user: this.keypair.publicKey(),
@@ -461,7 +578,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      STAKING_CONTRACT_ADDRESS,
+      this.stakingContract,
       'unstake',
       {
         user: this.keypair.publicKey(),
@@ -481,7 +598,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      STAKING_CONTRACT_ADDRESS,
+      this.stakingContract,
       'claim_rewards',
       {
         user: this.keypair.publicKey()
@@ -502,7 +619,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        STAKING_CONTRACT_ADDRESS,
+        this.stakingContract,
         'pending_rewards',
         { user: addr }
       );
@@ -524,7 +641,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        STAKING_CONTRACT_ADDRESS,
+        this.stakingContract,
         'get_stake_balance',
         { user: addr }
       );
@@ -546,7 +663,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      FEE_DISTRIBUTOR_CONTRACT_ADDRESS,
+      this.feeDistributorContract,
       'claim_week',
       {
         user: this.keypair.publicKey(),
@@ -593,7 +710,7 @@ export class GovernanceSDK {
 
     try {
       const result = await this.simulateCall(
-        FEE_DISTRIBUTOR_CONTRACT_ADDRESS,
+        this.feeDistributorContract,
         'get_claimable_fees',
         { user: addr }
       );
@@ -610,7 +727,7 @@ export class GovernanceSDK {
   async getTotalFeesCollected(): Promise<bigint> {
     try {
       const result = await this.simulateCall(
-        FEE_DISTRIBUTOR_CONTRACT_ADDRESS,
+        this.feeDistributorContract,
         'get_total_fees_collected',
         {}
       );
@@ -649,7 +766,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'propose',
       {
         proposer: this.keypair.publicKey(),
@@ -682,7 +799,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'vote',
       {
         voter: this.keypair.publicKey(),
@@ -705,7 +822,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'queue',
       {
         proposal_id: proposalId
@@ -724,7 +841,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'execute',
       {
         proposal_id: proposalId
@@ -743,7 +860,7 @@ export class GovernanceSDK {
     }
 
     const transaction = await this.buildTransaction(
-      GOVERNANCE_CONTRACT_ADDRESS,
+      this.governanceContract,
       'cancel',
       {
         proposal_id: proposalId
@@ -759,25 +876,25 @@ export class GovernanceSDK {
   async getProposal(proposalId: number): Promise<GovernanceProposal> {
     try {
       const result = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'get_proposal',
         { proposal_id: proposalId }
       );
 
       const stateRaw = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'get_proposal_state',
         { proposal_id: proposalId }
       );
 
       const hasQuorum = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'has_quorum',
         { proposal_id: proposalId }
       );
 
       const hasPassed = await this.simulateCall(
-        GOVERNANCE_CONTRACT_ADDRESS,
+        this.governanceContract,
         'has_passed',
         { proposal_id: proposalId }
       );
@@ -807,10 +924,15 @@ export class GovernanceSDK {
 
   /**
    * Get all proposals
+   *
+   * @param maxProposals Highest proposal ID to probe. Defaults to 1000, which
+   *   is the SDK's historical scan ceiling. Each probe is a separate
+   *   `simulateTransaction`, so UI callers should pass a bound close to the
+   *   real proposal count rather than paying for a 1000-ID sweep.
    */
-  async getAllProposals(): Promise<GovernanceProposal[]> {
+  async getAllProposals(maxProposals: number = 1000): Promise<GovernanceProposal[]> {
     const proposals: GovernanceProposal[] = [];
-    const MAX_PROPOSALS = 1000;
+    const MAX_PROPOSALS = maxProposals;
     let consecutiveMisses = 0;
 
     for (let i = 0; i < MAX_PROPOSALS; i++) {
@@ -866,10 +988,10 @@ export class GovernanceSDK {
   async getProtocolParameters(): Promise<ProtocolParameters> {
     try {
       const [performanceFee, withdrawalFee, rebalanceThreshold, insuranceReserve] = await Promise.all([
-        this.simulateCall(GOVERNANCE_CONTRACT_ADDRESS, 'get_performance_fee', {}),
-        this.simulateCall(GOVERNANCE_CONTRACT_ADDRESS, 'get_withdrawal_fee', {}),
-        this.simulateCall(GOVERNANCE_CONTRACT_ADDRESS, 'get_rebalance_threshold', {}),
-        this.simulateCall(GOVERNANCE_CONTRACT_ADDRESS, 'get_insurance_reserve_target', {})
+        this.simulateCall(this.governanceContract, 'get_performance_fee', {}),
+        this.simulateCall(this.governanceContract, 'get_withdrawal_fee', {}),
+        this.simulateCall(this.governanceContract, 'get_rebalance_threshold', {}),
+        this.simulateCall(this.governanceContract, 'get_insurance_reserve_target', {})
       ]);
 
       return {
@@ -892,7 +1014,7 @@ export class GovernanceSDK {
     newValue: number
   ): Promise<Transaction> {
     const callData: CallData[] = [{
-      contractAddress: GOVERNANCE_CONTRACT_ADDRESS,
+      contractAddress: this.governanceContract,
       functionName: `set_${parameter}`,
       args: [newValue]
     }];
@@ -999,9 +1121,81 @@ export class GovernanceSDK {
     transaction.sign(this.keypair);
     return transaction;
   }
+
+  /**
+   * Submit a signed transaction and wait for it to be included on chain.
+   *
+   * The build-and-sign helpers in this class return a signed `Transaction`
+   * without sending it, so a caller that only uses those can appear to succeed
+   * while nothing ever reaches the ledger. This is the missing half: it sends
+   * the transaction and polls until the RPC confirms success or failure.
+   *
+   * @param transaction Signed transaction from one of this class's methods.
+   * @param options.timeoutMs How long to wait for inclusion (default 60s).
+   * @param options.pollIntervalMs Delay between polls (default 1s).
+   */
+  async submitTransaction(
+    transaction: Transaction,
+    options: { timeoutMs?: number; pollIntervalMs?: number } = {}
+  ): Promise<SubmittedTransaction> {
+    const timeoutMs = options.timeoutMs ?? 60_000;
+    const pollIntervalMs = options.pollIntervalMs ?? 1_000;
+
+    const sendResult = await this.server.sendTransaction(transaction);
+    const hash = sendResult.hash;
+
+    if (sendResult.status === 'ERROR') {
+      return {
+        hash,
+        success: false,
+        error: 'The RPC rejected this transaction (status ERROR).',
+      };
+    }
+
+    if (sendResult.status === 'TRY_AGAIN_LATER') {
+      return {
+        hash,
+        success: false,
+        error: 'The RPC asked us to retry later (status TRY_AGAIN_LATER).',
+      };
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const poll = await this.server.getTransaction(hash);
+
+      if (poll.status === 'SUCCESS') {
+        return { hash, success: true, ledger: poll.ledger };
+      }
+      if (poll.status === 'FAILED') {
+        return {
+          hash,
+          success: false,
+          ledger: poll.ledger,
+          error: 'The transaction was included but failed on chain.',
+        };
+      }
+
+      // NOT_FOUND: still waiting for the next ledger close.
+      await new Promise((resolve) => setTimeout(resolve, pollIntervalMs));
+    }
+
+    return {
+      hash,
+      success: false,
+      error: `Timed out after ${timeoutMs}ms waiting for the transaction to be included.`,
+    };
+  }
 }
 
 // ===== Standalone Functions =====
+
+/**
+ * Decimals used by Stellar Asset Contract (SAC) tokens, which includes the
+ * governance token. Vault LP tokens may use a different value, so callers
+ * handling those must pass `decimals` explicitly.
+ */
+export const DEFAULT_TOKEN_DECIMALS = 7;
 
 /**
  * Calculate voting power at a specific time
@@ -1035,11 +1229,116 @@ export function calculateBoostMultiplier(
 /**
  * Format voting power for display
  */
-export function formatVotingPower(votingPower: bigint, decimals: number = 7): string {
+export function formatVotingPower(
+  votingPower: bigint,
+  decimals: number = DEFAULT_TOKEN_DECIMALS
+): string {
   const divisor = BigInt(10 ** decimals);
   const whole = votingPower / divisor;
   const fractional = votingPower % divisor;
   return `${whole}.${fractional.toString().padStart(decimals, '0')}`;
+}
+
+/**
+ * Format a base-unit amount for display, trimming trailing fractional zeros.
+ *
+ * Stellar governance tokens use 7 decimals, but vault LP tokens may use 18, so
+ * every display site must be told which token it is rendering rather than
+ * assuming 7. This is the display counterpart to {@link parseStroops}.
+ *
+ * @param amount Amount in the token's smallest unit.
+ * @param decimals Token decimals (7 for governance tokens, 18 for some LP tokens).
+ */
+export function formatAmount(amount: bigint, decimals: number = DEFAULT_TOKEN_DECIMALS): string {
+  const negative = amount < 0n;
+  const magnitude = negative ? -amount : amount;
+  const divisor = BigInt(10) ** BigInt(decimals);
+  const whole = magnitude / divisor;
+  const fractional = (magnitude % divisor).toString().padStart(decimals, '0').replace(/0+$/, '');
+  const sign = negative ? '-' : '';
+  return fractional.length > 0 ? `${sign}${whole}.${fractional}` : `${sign}${whole}`;
+}
+
+/**
+ * Parse a human-readable decimal string into a base-unit `bigint`.
+ *
+ * This is the missing inverse of {@link formatVotingPower} /
+ * {@link formatAmount}. Amounts must never round-trip through
+ * `parseFloat`/`Number`, because IEEE-754 doubles cannot represent 7-decimal
+ * token amounts exactly: `BigInt(Math.floor(parseFloat('1.1') * 1e7))` yields
+ * `10999999999` instead of `11000000`, and large balances silently lose
+ * precision once they exceed `Number.MAX_SAFE_INTEGER`.
+ *
+ * Parsing is done on the decimal string directly:
+ * - thousands separators (`,`) and surrounding whitespace are ignored;
+ * - `''`, `'.'` and `undefined`/`null` parse to `0n` (an empty amount input);
+ * - digits beyond `decimals` are truncated, never rounded up, so a user can
+ *   never be charged more than they typed;
+ * - negative values and non-numeric input throw, since a negative token
+ *   amount is never a valid user input.
+ *
+ * @param value Decimal amount as typed by a human, e.g. `'12.3456789'`.
+ * @param decimals Token decimals (7 for governance tokens, 18 for some LP tokens).
+ */
+export function parseStroops(
+  value: string | number | null | undefined,
+  decimals: number = DEFAULT_TOKEN_DECIMALS
+): bigint {
+  if (value === null || value === undefined) return 0n;
+
+  let text: string;
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) {
+      throw new Error(`Cannot parse "${value}" as a token amount`);
+    }
+    text = numberToPlainDecimalString(value);
+  } else {
+    text = value.trim().replace(/,/g, '');
+  }
+
+  if (text === '' || text === '.') return 0n;
+
+  const match = /^(\d+)(?:\.(\d*))?$/.exec(text);
+  if (!match) {
+    throw new Error(
+      `Cannot parse "${value}" as a token amount: expected a non-negative decimal number`
+    );
+  }
+
+  const whole = match[1];
+  let fraction = match[2] ?? '';
+
+  // Truncate, never round, so the parsed amount is never larger than typed.
+  if (fraction.length > decimals) {
+    fraction = fraction.slice(0, decimals);
+  }
+  fraction = fraction.padEnd(decimals, '0');
+
+  return BigInt(whole) * BigInt(10) ** BigInt(decimals) + BigInt(fraction === '' ? '0' : fraction);
+}
+
+/**
+ * Expand a JS number's exponential notation (`1e-7`) into a plain decimal
+ * string so `parseStroops` can process it without float arithmetic.
+ */
+function numberToPlainDecimalString(value: number): string {
+  const text = String(value);
+
+  const exponential = /^(-?)(\d+)(?:\.(\d+))?[eE]([+-]?\d+)$/.exec(text);
+  if (!exponential) return text;
+
+  const [, sign, intPart, fracPart = '', rawExponent] = exponential;
+  const exponent = Number(rawExponent);
+  const digits = intPart + fracPart;
+  const pointIndex = intPart.length + exponent;
+
+  if (pointIndex <= 0) {
+    return `${sign}0.${'0'.repeat(-pointIndex)}${digits}`;
+  }
+  if (pointIndex >= digits.length) {
+    return `${sign}${digits}${'0'.repeat(pointIndex - digits.length)}`;
+  }
+  return `${sign}${digits.slice(0, pointIndex)}.${digits.slice(pointIndex)}`;
 }
 
 /**

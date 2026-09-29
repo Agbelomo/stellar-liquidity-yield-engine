@@ -80,8 +80,7 @@ pub struct ArbitrageOpportunity {
 pub struct ArbitrageThresholds {
     pub min_apy_delta: u32, // Minimum APY difference to trigger rebalance (basis points)
     pub max_il_tolerance: u32, // Maximum acceptable IL (basis points)
-    pub cooldown_period: u64, // Seconds between rebalances per vault
-    pub last_rebalance_time: u64, // Timestamp of last rebalance
+    pub cooldown_period: u64, // Seconds between rebalances, applied per vault
 }
 
 /// One oracle observation for a pool (Issue #105)
@@ -768,7 +767,6 @@ impl RebalanceEngine {
             min_apy_delta,
             max_il_tolerance,
             cooldown_period,
-            last_rebalance_time: 0u64,
         };
         
         env.storage().instance().set(&Symbol::new(&env, "arbitrage_thresholds"), &thresholds);
@@ -788,7 +786,6 @@ impl RebalanceEngine {
                 min_apy_delta: 200u32, // Default 2%
                 max_il_tolerance: 100u32, // Default 1%
                 cooldown_period: 86400u64, // Default 24 hours
-                last_rebalance_time: 0u64,
             })
     }
 
@@ -870,6 +867,54 @@ impl RebalanceEngine {
         (total_cost, net_profit, is_profitable)
     }
 
+    // ============ PER-VAULT REBALANCE COOLDOWN (Issue #109) ============
+
+    /// Timestamp of the last successful rebalance for a vault, or 0 if the vault
+    /// has never rebalanced.
+    pub fn get_vault_last_rebalance_time(env: Env, vault_id: Address) -> u64 {
+        Self::get_last_rebalance_times(env).get(vault_id).unwrap_or(0u64)
+    }
+
+    /// Seconds until the vault is allowed to rebalance again. Returns 0 when the
+    /// vault has never rebalanced or its cooldown has already expired.
+    pub fn get_vault_cooldown_remaining(env: Env, vault_id: Address) -> u64 {
+        let last = match Self::get_last_rebalance_times(env.clone()).get(vault_id) {
+            Some(last) => last,
+            None => return 0,
+        };
+
+        let elapsed = env.ledger().timestamp().saturating_sub(last);
+        let cooldown = Self::get_arbitrage_thresholds(env).cooldown_period;
+        cooldown.saturating_sub(elapsed)
+    }
+
+    /// True while the vault is still inside its own cooldown window.
+    pub fn is_vault_in_cooldown(env: Env, vault_id: Address) -> bool {
+        Self::get_vault_cooldown_remaining(env, vault_id) > 0
+    }
+
+    /// Internal: the per-vault cooldown map
+    fn get_last_rebalance_times(env: Env) -> Map<Address, u64> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "vault_last_rebalance_times"))
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Internal: record a successful rebalance for this vault only
+    fn record_vault_rebalance(env: &Env, vault_id: Address) {
+        let mut times = Self::get_last_rebalance_times(env.clone());
+        times.set(vault_id.clone(), env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "vault_last_rebalance_times"), &times);
+
+        env.events().publish(
+            (Symbol::new(env, "vault_rebalanced"), vault_id),
+            (env.ledger().timestamp(),),
+        );
+    }
+
     /// Execute atomic flash rebalance: withdraw → swap → deposit in single transaction
     /// Cooldown is tracked per vault so one vault's rebalance does not block others.
     pub fn execute_flash_rebalance(
@@ -881,19 +926,8 @@ impl RebalanceEngine {
     ) -> bool {
         Self::require_not_paused(&env);
 
-        // Check per-vault cooldown
-        let thresholds = Self::get_arbitrage_thresholds(env.clone());
-        let last_rebalance_times: Map<Address, u64> = env
-            .storage()
-            .instance()
-            .get(&Symbol::new(&env, "vault_last_rebalance_times"))
-            .unwrap_or(Map::new(&env));
-
-        let vault_last_time = last_rebalance_times.get(vault_id.clone()).unwrap_or(0u64);
-        let time_since_last = env.ledger().timestamp() - vault_last_time;
-
         // Enforce cooldown per vault to prevent churn
-        if time_since_last < thresholds.cooldown_period {
+        if Self::is_vault_in_cooldown(env.clone(), vault_id.clone()) {
             return false;
         }
 
@@ -934,10 +968,8 @@ impl RebalanceEngine {
         );
 
         if deposited {
-            // Update per-vault last rebalance timestamp
-            let mut times = last_rebalance_times;
-            times.set(vault_id, env.ledger().timestamp());
-            env.storage().instance().set(&Symbol::new(&env, "vault_last_rebalance_times"), &times);
+            // Update this vault's cooldown only; other vaults stay free to rebalance.
+            Self::record_vault_rebalance(&env, vault_id);
         }
 
         deposited
@@ -974,6 +1006,8 @@ mod tests {
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
     use soroban_sdk::{Env, Symbol, Vec};
+
+    use crate::YieldVault;
 
     fn il(env: &Env, current: i128, entry: i128) -> u32 {
         let pool = Address::generate(env);

@@ -1,11 +1,20 @@
-/**
+﻿/**
  * VotingPanel Component
  * 
  * Allows users to cast votes on governance proposals with power breakdown.
  */
 
-import React, { useState, useMemo, useEffect } from 'react';
-import { GovernanceProposal, formatVotingPower, formatDuration, hasProposalPassed } from '../../sdk/src/governance';
+import React, { useState, useMemo } from 'react';
+import type { GovernanceProposal } from '../../sdk/src/governance';
+import {
+  ProposalState,
+  formatVotingPower,
+  formatAmount,
+  formatDuration,
+  hasProposalPassed,
+  parseStroops,
+  DEFAULT_TOKEN_DECIMALS,
+} from '../../sdk/src/governance';
 
 interface VotingPanelProps {
   proposal: GovernanceProposal;
@@ -14,6 +23,8 @@ interface VotingPanelProps {
   totalSupply: bigint;
   hasVoted: boolean;
   votedFor: boolean | null;
+  /** Decimals of the governance token (7 for a Stellar Asset Contract token). */
+  tokenDecimals?: number;
   onVote: (support: boolean, amount: bigint, reason: string) => Promise<void>;
   onClose: () => void;
   loading?: boolean;
@@ -26,6 +37,7 @@ const VotingPanel: React.FC<VotingPanelProps> = ({
   totalSupply,
   hasVoted,
   votedFor,
+  tokenDecimals = DEFAULT_TOKEN_DECIMALS,
   onVote,
   onClose,
   loading = false
@@ -90,11 +102,25 @@ const VotingPanel: React.FC<VotingPanelProps> = ({
 
   // Handle custom amount
   const handleAmountChange = (value: string) => {
-    const numValue = parseFloat(value) * 1e7; // Assuming 7 decimals
-    if (!isNaN(numValue) && numValue >= 0) {
-      const amount = BigInt(Math.floor(numValue));
-      setVoteAmount(amount);
+    let amount: bigint;
+    try {
+      // Decimal-aware parse in base units (issue #103). This replaces the old
+      // `BigInt(Math.floor(parseFloat(value) * 1e7))`, which lost precision
+      // for values like 1.005 and silently mis-scaled non-7-decimal tokens.
+      amount = parseStroops(value, tokenDecimals);
+    } catch {
+      // Reject input the parser cannot interpret, mirroring the old
+      // `!isNaN(numValue)` guard, instead of letting it throw in render.
+      return;
+    }
+
+    setVoteAmount(amount);
+
+    // A voter with no voting power must not divide by zero (RangeError).
+    if (userVotingPower > 0n) {
       setVotePercentage(Number((amount * BigInt(100)) / userVotingPower));
+    } else {
+      setVotePercentage(0);
     }
   };
 
@@ -113,7 +139,7 @@ const VotingPanel: React.FC<VotingPanelProps> = ({
   // Check if voting is allowed
   const canVote = useMemo(() => {
     return (
-      proposal.state === 'active' &&
+      proposal.state === ProposalState.Active &&
       userAddress &&
       userVotingPower > BigInt(0) &&
       !hasVoted
@@ -165,7 +191,7 @@ const VotingPanel: React.FC<VotingPanelProps> = ({
           <div className="flex justify-between items-center mb-3">
             <h3 className="font-semibold text-gray-900">Current Results</h3>
             <span className={`text-sm font-medium ${voteBreakdown.passed ? 'text-green-600' : 'text-red-600'}`}>
-              {voteBreakdown.passed ? '✓ Passing' : '✗ Not Passing'}
+              {voteBreakdown.passed ? 'âœ“ Passing' : 'âœ— Not Passing'}
             </span>
           </div>
           
@@ -327,7 +353,7 @@ const VotingPanel: React.FC<VotingPanelProps> = ({
                     <div className="w-32">
                       <input
                         type="number"
-                        value={Number(voteAmount) / 1e7}
+                        value={formatAmount(voteAmount, tokenDecimals)}
                         onChange={(e) => handleAmountChange(e.target.value)}
                         className="w-full px-3 py-2 border border-gray-300 rounded-lg"
                         placeholder="Amount"

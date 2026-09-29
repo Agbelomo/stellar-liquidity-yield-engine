@@ -7,6 +7,7 @@ import { Label } from '@/components/ui/label';
 import { Shield, Zap, Target, TrendingUp, AlertTriangle, CheckCircle, RefreshCw } from 'lucide-react';
 import { YieldStrategy, RiskLevel } from 'stellar-liquidity-yield-engine-sdk';
 import { StrategyRegistryClient } from 'stellar-liquidity-yield-engine-sdk';
+import { getNetworkConfig, type UiNetwork } from '../config/network';
 
 interface StrategySelectorProps {
   onStrategySelect?: (strategy: YieldStrategy) => void;

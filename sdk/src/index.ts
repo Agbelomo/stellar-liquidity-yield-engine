@@ -1,7 +1,7 @@
 // Main exports for the Stellar Liquidity Yield Engine SDK
 
 import { Keypair, Networks } from 'stellar-sdk';
-import { GovernanceSDK } from './governance';
+import { GovernanceSDK, type GovernanceContracts } from './governance';
 
 export * from './types';
 export { VaultClient } from './vaultClient';
@@ -26,9 +26,15 @@ export {
   type LockInfo,
   type FeeDistribution,
   type ProtocolParameters,
+  type GovernanceContracts,
+  DEFAULT_GOVERNANCE_CONTRACTS,
+  DEFAULT_TOKEN_DECIMALS,
+  isContractConfigured,
   calculateVotingPower,
   calculateBoostMultiplier,
   formatVotingPower,
+  formatAmount,
+  parseStroops,
   formatBasisPoints,
   formatDuration,
   hasProposalPassed,
@@ -64,17 +70,21 @@ function contractsFromEnv() {
 }
 
 // Network configurations
+//
+// Public endpoints are only defaults: every one of them can be pointed at a
+// custom RPC via the environment, which is what `SOROBAN_RPC_URL` /
+// `HORIZON_URL` in `.env.example` are for. See `.emdfile` for the convention.
 export const TESTNET_CONFIG = {
   network: 'testnet' as const,
-  horizonUrl: 'https://horizon-testnet.stellar.org',
-  sorobanRpcUrl: 'https://soroban-testnet.stellar.org',
+  horizonUrl: process.env.HORIZON_URL || 'https://horizon-testnet.stellar.org',
+  sorobanRpcUrl: process.env.SOROBAN_RPC_URL || 'https://soroban-testnet.stellar.org',
   contracts: contractsFromEnv()
 };
 
 export const MAINNET_CONFIG = {
   network: 'mainnet' as const,
-  horizonUrl: 'https://horizon.stellar.org',
-  sorobanRpcUrl: 'https://soroban.stellar.org',
+  horizonUrl: process.env.MAINNET_HORIZON_URL || 'https://horizon.stellar.org',
+  sorobanRpcUrl: process.env.MAINNET_SOROBAN_RPC_URL || 'https://soroban.stellar.org',
   contracts: contractsFromEnv()
 };
 
@@ -96,6 +106,14 @@ export interface CreateGovernanceClientOptions {
    * pass the keypair here to enable signing.
    */
   keypair?: Keypair;
+  /**
+   * Contract IDs for the governance deployment. Anything omitted falls back to
+   * `DEFAULT_GOVERNANCE_CONTRACTS`, which is read from `process.env`.
+   *
+   * Browser bundles cannot read server-side environment variables, so UI
+   * callers must pass these explicitly.
+   */
+  contracts?: Partial<GovernanceContracts>;
 }
 
 export function createGovernanceClient(
@@ -104,7 +122,12 @@ export function createGovernanceClient(
 ): GovernanceSDK {
   const config = network === 'testnet' ? TESTNET_CONFIG : MAINNET_CONFIG;
   const networkPassphrase = network === 'testnet' ? Networks.TESTNET : Networks.PUBLIC;
-  return new GovernanceSDK(config.sorobanRpcUrl, networkPassphrase, options.keypair);
+  return new GovernanceSDK(
+    config.sorobanRpcUrl,
+    networkPassphrase,
+    options.keypair,
+    options.contracts
+  );
 }
 
 // Version - single source of truth from package.json

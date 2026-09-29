@@ -1,16 +1,17 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
-import { VaultClient, VaultInfo, VaultMetrics, UserPosition, NetworkConfig } from 'stellar-liquidity-yield-engine-sdk';
+﻿import { useState, useEffect, useCallback, useMemo } from 'react';
+import { VaultClient, VaultInfo, VaultMetrics, UserPosition } from 'stellar-liquidity-yield-engine-sdk';
 import {
   createFreighterSigner,
   getFreighterPublicKey,
   isFreighterAvailable,
   isFreighterConnected,
 } from '../lib/freighter';
+import { getNetworkConfig, type UiNetwork } from '../config/network';
 
 interface UseYieldVaultOptions {
   vaultAddress: string;
   userAddress: string;
-  network?: 'testnet' | 'mainnet';
+  network?: UiNetwork;
   autoRefresh?: boolean;
   refreshInterval?: number;
   signer?: any;
@@ -41,29 +42,13 @@ interface UseYieldVaultReturn {
   disconnect: () => void;
 }
 
-const networkConfigFor = (network: 'testnet' | 'mainnet'): NetworkConfig =>
-  ({
-    network,
-    horizonUrl:
-      network === 'mainnet'
-        ? 'https://horizon.stellar.org'
-        : 'https://horizon-testnet.stellar.org',
-    sorobanRpcUrl:
-      network === 'mainnet'
-        ? 'https://soroban.stellar.org'
-        : 'https://soroban-testnet.stellar.org',
-    contracts: {
-      yieldEngine: '',
-      rewardDistributor: '',
-      rebalanceEngine: '',
-      strategyRegistry: '',
-    },
-  } as NetworkConfig);
-
+// Network endpoints and contract IDs come from the environment via
+// `../config/network` (issue #101) instead of being hardcoded here. Defaults to
+// the configured network when the caller does not specify one.
 export const useYieldVault = ({
   vaultAddress,
   userAddress,
-  network = 'testnet',
+  network,
   autoRefresh = false,
   refreshInterval = 30000, // 30 seconds
   signer,
@@ -82,9 +67,13 @@ export const useYieldVault = ({
   const [walletAddress, setWalletAddress] = useState<string | null>(null);
   const [connecting, setConnecting] = useState(false);
 
+  // `undefined` means "use the network from the environment".
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
+  const activeNetwork = networkConfig.network;
+
   const vaultClient = useMemo(
-    () => new VaultClient(vaultAddress, networkConfigFor(network)),
-    [vaultAddress, network]
+    () => new VaultClient(vaultAddress, networkConfig),
+    [vaultAddress, networkConfig]
   );
 
   // Active signer: explicit signer prop, or keypair prop, or Freighter wallet
@@ -357,7 +346,7 @@ export const useYieldVault = ({
 interface UseMultipleVaultsOptions {
   vaultAddresses: string[];
   userAddress: string;
-  network?: 'testnet' | 'mainnet';
+  network?: UiNetwork;
   autoRefresh?: boolean;
   refreshInterval?: number;
 }
@@ -365,7 +354,7 @@ interface UseMultipleVaultsOptions {
 export const useMultipleVaults = ({
   vaultAddresses,
   userAddress,
-  network = 'testnet',
+  network,
   autoRefresh = false,
   refreshInterval = 30000
 }: UseMultipleVaultsOptions) => {
@@ -380,6 +369,9 @@ export const useMultipleVaults = ({
 
   const [overallLoading, setOverallLoading] = useState(true);
   const [overallError, setOverallError] = useState<string | null>(null);
+
+  // One config for every vault, so all of them hit the same RPC endpoint.
+  const networkConfig = useMemo(() => getNetworkConfig(network), [network]);
 
   const refreshVault = useCallback(async (vaultAddress: string) => {
     try {
@@ -423,7 +415,7 @@ export const useMultipleVaults = ({
         error: err.message
       })));
     }
-  }, [network, userAddress]);
+  }, [networkConfig, userAddress]);
 
   const refreshAll = useCallback(async () => {
     setOverallLoading(true);
@@ -503,7 +495,7 @@ export const useMultipleVaults = ({
 };
 
 // Hook for vault performance tracking
-export const useVaultPerformance = (vaultAddress: string, network: 'testnet' | 'mainnet' = 'testnet') => {
+export const useVaultPerformance = (vaultAddress: string, network?: UiNetwork) => {
   const [performanceData, setPerformanceData] = useState<{
     apyHistory: number[];
     tvlHistory: bigint[];

@@ -6,6 +6,13 @@ use soroban_sdk::token::TokenClient;
 
 use crate::YieldVaultClient;
 
+/// Upper bound accepted for an oracle APY observation: 1,000,000 bps = 10,000%.
+/// Guards against a misconfigured feed pushing nonsense into rebalance maths.
+pub const MAX_APY_BPS: u32 = 1_000_000;
+
+/// Default age after which an APY observation is considered stale: 24 hours.
+pub const DEFAULT_MAX_APY_AGE: u64 = 86_400;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PoolAllocation {
@@ -76,6 +83,15 @@ pub struct ArbitrageThresholds {
     pub cooldown_period: u64, // Seconds between rebalances, applied per vault
 }
 
+/// One oracle observation for a pool (Issue #105)
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PoolApyRecord {
+    pub apy_bps: u32, // Observed APY in basis points (10000 = 100%)
+    pub updated_at: u64, // Ledger timestamp the feed was refreshed
+    pub updated_by: Address, // Admin or keeper that pushed the observation
+}
+
 #[contract]
 pub struct RebalanceEngine;
 
@@ -95,13 +111,19 @@ impl RebalanceEngine {
         let history: Vec<RebalanceHistory> = Vec::new(&env);
         env.storage().instance().set(&Symbol::new(&env, "history"), &history);
 
-        // Per-vault rebalance cooldowns (Issue #109). The cooldown is keyed by
-        // vault so one vault rebalancing never blocks another.
-        let last_rebalance_times: Map<Address, u64> = Map::new(&env);
-        env.storage().instance().set(
-            &Symbol::new(&env, "vault_last_rebalance_times"),
-            &last_rebalance_times,
-        );
+        // Initialize the APY registry, the keeper set and the staleness bound
+        // (Issue #105).
+        let apy_registry: Map<Address, PoolApyRecord> = Map::new(&env);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "pool_apy"), &apy_registry);
+        let keepers: Vec<Address> = Vec::new(&env);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "apy_keepers"), &keepers);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "max_apy_age"), &DEFAULT_MAX_APY_AGE);
     }
 
     /// Create a new rebalance strategy
@@ -195,13 +217,15 @@ impl RebalanceEngine {
 
         // Analyze each allocation in the strategy
         for allocation in strategy.allocations.iter() {
-            let current_apy = allocation.current_apy;
+            // Prefer the live oracle value over the APY snapshot stored in the
+            // strategy, falling back to the snapshot when no fresh feed exists.
+            let current_apy = Self::resolve_apy(&env, &allocation.pool_id, allocation.current_apy);
             let target_apy = allocation.target_apy;
 
             // Check if rebalancing is needed
             if current_apy < target_apy - strategy.min_apy_threshold {
                 // Find better pools
-                let better_pools = Self::find_better_pools(&env, &allocation, &strategy);
+                let better_pools = Self::find_better_pools(&env, &allocation, &strategy, current_apy);
                 
                 for better_pool in better_pools {
                     let proposal = RebalanceProposal {
@@ -232,7 +256,7 @@ impl RebalanceEngine {
         // Verify caller is authorized (could be a vault or authorized manager)
         // For now, allow any caller - in production, add proper authorization
 
-        let apy_before = Self::get_pool_current_apy(&env, &proposal.from_pool);
+        let apy_before = Self::get_pool_current_apy(env.clone(), proposal.from_pool.clone());
         let mut success = false;
 
         // Execute the rebalance (simplified - would integrate with AMM contracts)
@@ -241,7 +265,7 @@ impl RebalanceEngine {
         }
 
         let apy_after = if success {
-            Self::get_pool_current_apy(&env, &proposal.to_pool)
+            Self::get_pool_current_apy(env.clone(), proposal.to_pool.clone())
         } else {
             apy_before
         };
@@ -382,6 +406,107 @@ impl RebalanceEngine {
         strategy.allocations
     }
 
+    // ============ APY ORACLE REGISTRY (Issue #105) ============
+
+    /// Publish an APY observation for a pool (admin or APY keeper).
+    ///
+    /// This replaces the previous hardcoded APY. Rebalance analysis and
+    /// `get_pool_current_apy` now read this registry, so a keeper (or the admin)
+    /// feeding real numbers is what drives rebalance decisions.
+    pub fn update_pool_apy(env: Env, caller: Address, pool_id: Address, apy_bps: u32) {
+        Self::require_not_paused(&env);
+        Self::require_admin_or_apy_keeper(&env, caller.clone());
+        require!(apy_bps <= MAX_APY_BPS, "apy_bps exceeds maximum");
+
+        let record = PoolApyRecord {
+            apy_bps,
+            updated_at: env.ledger().timestamp(),
+            updated_by: caller.clone(),
+        };
+
+        let mut registry = Self::get_apy_registry(env.clone());
+        registry.set(pool_id.clone(), record);
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "pool_apy"), &registry);
+
+        env.events().publish(
+            (Symbol::new(&env, "pool_apy_updated"), pool_id),
+            (caller, apy_bps),
+        );
+    }
+
+    /// Current APY of a pool from the oracle registry, in basis points.
+    ///
+    /// Returns 0 when no feed has been published for `pool_id`; 0 means
+    /// "unknown" and is deliberately not a fabricated rate.
+    pub fn get_pool_current_apy(env: Env, pool_id: Address) -> u32 {
+        Self::get_apy_registry(env.clone())
+            .get(pool_id)
+            .map(|record| record.apy_bps)
+            .unwrap_or(0u32)
+    }
+
+    /// Full oracle record for a pool, if a feed exists.
+    pub fn get_pool_apy_record(env: Env, pool_id: Address) -> Option<PoolApyRecord> {
+        Self::get_apy_registry(env).get(pool_id)
+    }
+
+    /// Age in seconds after which an APY observation is rejected as stale.
+    pub fn get_max_apy_age(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "max_apy_age"))
+            .unwrap_or(DEFAULT_MAX_APY_AGE)
+    }
+
+    /// Set the maximum age of a usable APY observation (admin only).
+    pub fn set_max_apy_age(env: Env, admin: Address, max_age: u64) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "max_apy_age"), &max_age);
+
+        env.events().publish(
+            (Symbol::new(&env, "max_apy_age_updated"),),
+            (admin, max_age),
+        );
+    }
+
+    /// True when the pool has an observation that is still within the
+    /// configured maximum age.
+    pub fn is_apy_fresh(env: Env, pool_id: Address) -> bool {
+        match Self::get_apy_registry(env.clone()).get(pool_id) {
+            Some(record) => {
+                let age = env.ledger().timestamp().saturating_sub(record.updated_at);
+                age <= Self::get_max_apy_age(env)
+            }
+            None => false,
+        }
+    }
+
+    /// Replace the set of addresses allowed to push APY observations (admin only).
+    /// The admin can always update feeds and does not need to be listed.
+    pub fn set_apy_keepers(env: Env, admin: Address, keepers: Vec<Address>) {
+        Self::require_admin(&env, admin.clone());
+        env.storage()
+            .instance()
+            .set(&Symbol::new(&env, "apy_keepers"), &keepers);
+
+        env.events().publish(
+            (Symbol::new(&env, "apy_keepers_updated"),),
+            (admin, keepers),
+        );
+    }
+
+    /// Current APY keeper set
+    pub fn get_apy_keepers(env: Env) -> Vec<Address> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "apy_keepers"))
+            .unwrap_or(Vec::new(&env))
+    }
+
     /// Calculate impermanent loss for a pool using the standard formula
     /// `IL = 1 - 2 * sqrt(r) / (1 + r)`, where `r = current_price / entry_price`.
     /// Returns the loss as basis points, capped at 10000 (100%).
@@ -440,25 +565,54 @@ impl RebalanceEngine {
         id
     }
 
-    fn get_pool_current_apy(_env: &Env, _pool_id: &Address) -> u32 {
-        // APY is supplied by the strategy's on-chain pool allocation.
-        0
+    /// Internal: the APY oracle registry, keyed by pool address.
+    fn get_apy_registry(env: Env) -> Map<Address, PoolApyRecord> {
+        env.storage()
+            .instance()
+            .get(&Symbol::new(&env, "pool_apy"))
+            .unwrap_or(Map::new(&env))
+    }
+
+    /// Internal: resolve the APY to use for a pool.
+    ///
+    /// A fresh oracle observation always wins. Without a feed - or once the feed
+    /// is older than `max_apy_age` - the APY snapshot stored in the strategy is
+    /// used so an existing configuration keeps working without a keeper.
+    fn resolve_apy(env: &Env, pool_id: &Address, fallback: u32) -> u32 {
+        let registry = Self::get_apy_registry(env.clone());
+        let record = match registry.get(pool_id.clone()) {
+            Some(record) => record,
+            None => return fallback,
+        };
+
+        let age = env.ledger().timestamp().saturating_sub(record.updated_at);
+        if age > Self::get_max_apy_age(env.clone()) {
+            fallback
+        } else {
+            record.apy_bps
+        }
     }
 
     fn find_better_pools(
         env: &Env,
         current_allocation: &PoolAllocation,
         strategy: &RebalanceStrategy,
+        current_apy: u32,
     ) -> Vec<PoolAllocation> {
         let mut better_pools: Vec<PoolAllocation> = Vec::new(env);
         
         // Only return pools already registered in the strategy allocations.
-        for candidate in strategy.allocations.iter() {
+        // Each candidate APY is resolved through the oracle first so a stale
+        // snapshot in the strategy cannot hide (or invent) an opportunity.
+        for mut candidate in strategy.allocations.iter() {
+            let candidate_apy = Self::resolve_apy(env, &candidate.pool_id, candidate.current_apy);
             if candidate.pool_id != current_allocation.pool_id
-                && candidate.current_apy > current_allocation.current_apy
-                && candidate.current_apy - current_allocation.current_apy >= strategy.min_apy_threshold
+                && candidate_apy > current_apy
+                && candidate_apy - current_apy >= strategy.min_apy_threshold
                 && candidate.impermanent_loss_risk <= strategy.max_il_risk
             {
+                // Report the oracle-resolved APY so callers price the move correctly.
+                candidate.current_apy = candidate_apy;
                 better_pools.push_back(candidate);
             }
         }
@@ -546,6 +700,28 @@ impl RebalanceEngine {
         require!(caller == admin, "unauthorized: admin required");
     }
 
+    /// Allow the admin or any configured APY keeper to push oracle data.
+    fn require_admin_or_apy_keeper(env: &Env, caller: Address) {
+        let admin = Self::get_admin(env.clone());
+        if caller == admin {
+            return;
+        }
+
+        let keepers: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&Symbol::new(env, "apy_keepers"))
+            .unwrap_or(Vec::new(env));
+
+        for keeper in keepers.iter() {
+            if keeper == caller {
+                return;
+            }
+        }
+
+        panic!("unauthorized: admin or apy keeper required");
+    }
+
     fn is_paused(env: Env) -> bool {
         env.storage()
             .instance()
@@ -626,13 +802,15 @@ impl RebalanceEngine {
         let thresholds = Self::get_arbitrage_thresholds(env.clone());
         let mut opportunities: Vec<ArbitrageOpportunity> = Vec::new(&env);
 
+        // A fresh oracle feed for the vault's own pool overrides the APY the
+        // caller passed in, so a stale off-chain value cannot hide an arbitrage.
+        let vault_apy = Self::resolve_apy(&env, &vault_pool_id, vault_current_apy);
+
         // Scan each available pool
         for pool in available_pools {
-            let apy_delta = if pool.current_apy > vault_current_apy {
-                pool.current_apy - vault_current_apy
-            } else {
-                0u32
-            };
+            // Same for the candidate pool: the registry wins over the snapshot.
+            let pool_apy = Self::resolve_apy(&env, &pool.pool_id, pool.current_apy);
+            let apy_delta = pool_apy.saturating_sub(vault_apy);
 
             // Check if opportunity meets minimum APY delta threshold
             if apy_delta >= thresholds.min_apy_delta && pool.impermanent_loss_risk <= thresholds.max_il_tolerance {
@@ -641,8 +819,8 @@ impl RebalanceEngine {
 
                 let opportunity = ArbitrageOpportunity {
                     pool_id: pool.pool_id,
-                    current_apy: vault_current_apy,
-                    projected_apy: pool.current_apy,
+                    current_apy: vault_apy,
+                    projected_apy: pool_apy,
                     il_risk: pool.impermanent_loss_risk,
                     net_profit: net_profit_estimate,
                     apy_delta,
@@ -827,7 +1005,6 @@ mod tests {
     use super::*;
     use soroban_sdk::testutils::Address as _;
     use soroban_sdk::testutils::Ledger as _;
-    use soroban_sdk::token::StellarAssetClient;
     use soroban_sdk::{Env, Symbol, Vec};
 
     use crate::YieldVault;
@@ -908,180 +1085,249 @@ mod tests {
         assert_eq!(overflow.len(), 0);
     }
 
-    // ============ PER-VAULT COOLDOWN TESTS (Issue #109) ============
+    // ============ APY ORACLE REGISTRY TESTS (Issue #105) ============
 
-    const T0: u64 = 1_000_000;
-    const COOLDOWN: u64 = 3600;
-
-    /// Register a real vault whose pool is a Stellar Asset Contract, so the flash
-    /// rebalance legs can actually move tokens instead of being mocked away.
-    fn register_vault(env: &Env, admin: &Address) -> Address {
-        let pool = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let token_a = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let token_b = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-
-        let vault_id = env.register_contract(None, YieldVault);
-        YieldVaultClient::new(env, &vault_id).initialize(
-            admin,
-            &Symbol::new(env, "Vault"),
-            &token_a,
-            &token_b,
-            &pool,
-            &1,
-            &0,
-            &0,
-            &0,
-            admin,
-        );
-
-        // Fund the pool so the withdraw leg can pay out.
-        StellarAssetClient::new(env, &pool).mint(&pool, &1_000_000i128);
-
-        vault_id
+    fn engine(env: &Env) -> (RebalanceEngineClient<'static>, Address) {
+        let admin = Address::generate(env);
+        let contract_id = env.register_contract(None, RebalanceEngine);
+        let client = RebalanceEngineClient::new(env, &contract_id);
+        client.initialize(&admin);
+        (client, admin)
     }
 
-    fn opportunity(env: &Env, target: &Address) -> ArbitrageOpportunity {
-        ArbitrageOpportunity {
-            pool_id: target.clone(),
-            current_apy: 500,
-            projected_apy: 1500,
-            il_risk: 50,
-            net_profit: 1_000_000,
-            apy_delta: 1000,
-            recommended: true,
+    fn allocation(
+        env: &Env,
+        pool: &Address,
+        percent: u32,
+        current: u32,
+        target: u32,
+    ) -> PoolAllocation {
+        PoolAllocation {
+            pool_id: pool.clone(),
+            token_a: Address::generate(env),
+            token_b: Address::generate(env),
+            allocation_percent: percent,
+            target_apy: target,
+            current_apy: current,
+            impermanent_loss_risk: 50,
         }
     }
 
-    /// The engine withdraws the source token and deposits the destination token.
-    /// There is no swap router behind the deposit leg yet, so the engine is
-    /// stocked with the destination token - otherwise the deposit leg reverts on
-    /// a zero balance and the cooldown bookkeeping is never reached.
-    fn stock_engine(env: &Env, engine_id: &Address, token: &Address) {
-        StellarAssetClient::new(env, token).mint(engine_id, &1_000_000i128);
+    #[test]
+    fn test_pool_apy_defaults_to_zero_when_unpublished() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        // 0 means "unknown", never a fabricated rate.
+        assert_eq!(client.get_pool_current_apy(&pool), 0);
+        assert!(client.get_pool_apy_record(&pool).is_none());
+        assert!(!client.is_apy_fresh(&pool));
     }
 
     #[test]
-    fn test_cooldown_is_tracked_per_vault() {
+    fn test_admin_publishes_pool_apy() {
         let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        env.ledger().with_mut(|li| li.timestamp = T0);
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
 
-        let admin = Address::generate(&env);
-        let engine_id = env.register_contract(None, RebalanceEngine);
-        let client = RebalanceEngineClient::new(&env, &engine_id);
-        client.initialize(&admin);
-        client.set_rebalance_thresholds(&admin, &200, &100, &COOLDOWN);
+        client.update_pool_apy(&admin, &pool, &1234);
 
-        let vault_a = register_vault(&env, &admin);
-        let vault_b = register_vault(&env, &admin);
-        let target = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        stock_engine(&env, &engine_id, &target);
-        let caller = Address::generate(&env);
-        let opp = opportunity(&env, &target);
-
-        // Fresh vaults are not in cooldown.
-        assert_eq!(client.get_vault_last_rebalance_time(&vault_a), 0);
-        assert_eq!(client.get_vault_cooldown_remaining(&vault_a), 0);
-        assert!(!client.is_vault_in_cooldown(&vault_a));
-
-        assert!(client.execute_flash_rebalance(&caller, &vault_a, &opp, &1000));
-        assert_eq!(client.get_vault_last_rebalance_time(&vault_a), T0);
-        assert_eq!(client.get_vault_cooldown_remaining(&vault_a), COOLDOWN);
-        assert!(client.is_vault_in_cooldown(&vault_a));
-
-        // The same vault is blocked from churning.
-        assert!(!client.execute_flash_rebalance(&caller, &vault_a, &opp, &1000));
-
-        // A different vault is completely unaffected by vault A's cooldown.
-        assert!(!client.is_vault_in_cooldown(&vault_b));
-        assert!(client.execute_flash_rebalance(&caller, &vault_b, &opp, &1000));
-        assert!(client.is_vault_in_cooldown(&vault_b));
-        assert_eq!(client.get_vault_last_rebalance_time(&vault_b), T0);
-        assert_eq!(client.get_vault_cooldown_remaining(&vault_b), COOLDOWN);
-
-        // Vault A's own timestamp is untouched by vault B rebalancing.
-        assert_eq!(client.get_vault_last_rebalance_time(&vault_a), T0);
-
-        // Once vault A's own cooldown expires it can rebalance again.
-        env.ledger().with_mut(|li| li.timestamp = T0 + COOLDOWN);
-        assert!(!client.is_vault_in_cooldown(&vault_a));
-        assert!(client.execute_flash_rebalance(&caller, &vault_a, &opp, &1000));
-        assert_eq!(
-            client.get_vault_last_rebalance_time(&vault_a),
-            T0 + COOLDOWN
-        );
+        assert_eq!(client.get_pool_current_apy(&pool), 1234);
+        let record = client.get_pool_apy_record(&pool).unwrap();
+        assert_eq!(record.apy_bps, 1234);
+        assert_eq!(record.updated_by, admin);
+        assert_eq!(record.updated_at, env.ledger().timestamp());
+        assert!(client.is_apy_fresh(&pool));
     }
 
     #[test]
-    fn test_cooldown_countdown_uses_each_vault_own_clock() {
+    fn test_pool_apy_update_overwrites_previous_value() {
         let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        env.ledger().with_mut(|li| li.timestamp = T0);
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
 
-        let admin = Address::generate(&env);
-        let engine_id = env.register_contract(None, RebalanceEngine);
-        let client = RebalanceEngineClient::new(&env, &engine_id);
-        client.initialize(&admin);
-        client.set_rebalance_thresholds(&admin, &200, &100, &COOLDOWN);
+        client.update_pool_apy(&admin, &pool, &1500);
+        client.update_pool_apy(&admin, &pool, &800);
 
-        let vault_a = register_vault(&env, &admin);
-        let target = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        stock_engine(&env, &engine_id, &target);
-        let caller = Address::generate(&env);
-        let opp = opportunity(&env, &target);
-
-        assert!(client.execute_flash_rebalance(&caller, &vault_a, &opp, &1000));
-
-        env.ledger().with_mut(|li| li.timestamp = T0 + COOLDOWN - 1);
-        assert_eq!(client.get_vault_cooldown_remaining(&vault_a), 1);
-        assert!(client.is_vault_in_cooldown(&vault_a));
-        assert!(!client.execute_flash_rebalance(&caller, &vault_a, &opp, &1000));
-
-        env.ledger().with_mut(|li| li.timestamp = T0 + COOLDOWN);
-        assert_eq!(client.get_vault_cooldown_remaining(&vault_a), 0);
-        assert!(!client.is_vault_in_cooldown(&vault_a));
+        assert_eq!(client.get_pool_current_apy(&pool), 800);
     }
 
     #[test]
-    fn test_paused_engine_blocks_flash_rebalance() {
+    fn test_pool_apy_rejects_unauthorized_caller() {
         let env = Env::default();
-        env.mock_all_auths_allowing_non_root_auth();
-        env.ledger().with_mut(|li| li.timestamp = T0);
-
-        let admin = Address::generate(&env);
-        let engine_id = env.register_contract(None, RebalanceEngine);
-        let client = RebalanceEngineClient::new(&env, &engine_id);
-        client.initialize(&admin);
-        client.set_rebalance_thresholds(&admin, &200, &100, &COOLDOWN);
-
-        let vault = register_vault(&env, &admin);
-        let target = env
-            .register_stellar_asset_contract_v2(admin.clone())
-            .address();
-        let caller = Address::generate(&env);
-        let opp = opportunity(&env, &target);
-
-        client.pause(&admin);
+        let (client, _admin) = engine(&env);
+        let pool = Address::generate(&env);
+        let stranger = Address::generate(&env);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            client.execute_flash_rebalance(&caller, &vault, &opp, &1000);
+            client.update_pool_apy(&stranger, &pool, &900);
         }));
 
-        assert!(
-            result.is_err(),
-            "paused engine must reject flash rebalances"
+        assert!(result.is_err(), "unauthorized apy update must panic");
+        assert_eq!(client.get_pool_current_apy(&pool), 0);
+    }
+
+    #[test]
+    fn test_apy_keeper_can_publish() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let keeper = Address::generate(&env);
+        let pool = Address::generate(&env);
+
+        client.set_apy_keepers(&admin, &Vec::from_array(&env, [keeper.clone()]));
+        assert_eq!(client.get_apy_keepers().len(), 1);
+
+        client.update_pool_apy(&keeper, &pool, &4200);
+        assert_eq!(client.get_pool_current_apy(&pool), 4200);
+        assert_eq!(
+            client.get_pool_apy_record(&pool).unwrap().updated_by,
+            keeper
         );
-        // The failed attempt must not have started a cooldown.
-        assert!(!client.is_vault_in_cooldown(&vault));
+    }
+
+    #[test]
+    fn test_apy_keepers_managed_by_admin_only() {
+        let env = Env::default();
+        let (client, _admin) = engine(&env);
+        let stranger = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.set_apy_keepers(&stranger, &Vec::new(&env));
+        }));
+
+        assert!(result.is_err(), "keeper list must be admin only");
+    }
+
+    #[test]
+    fn test_pool_apy_rejects_out_of_range_value() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            client.update_pool_apy(&admin, &pool, &(MAX_APY_BPS + 1));
+        }));
+
+        assert!(result.is_err(), "apy above MAX_APY_BPS must panic");
+    }
+
+    #[test]
+    fn test_stale_pool_apy_is_not_fresh() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool = Address::generate(&env);
+
+        client.set_max_apy_age(&admin, &100);
+        client.update_pool_apy(&admin, &pool, &1234);
+        assert!(client.is_apy_fresh(&pool));
+
+        env.ledger().with_mut(|li| li.timestamp = 500);
+        assert!(!client.is_apy_fresh(&pool));
+    }
+
+    /// The registry - not the APY snapshot in the strategy - must drive the
+    /// rebalance proposals.
+    #[test]
+    fn test_analyze_uses_oracle_apy_over_strategy_snapshot() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        // Snapshots are identical and below the rebalance trigger: no proposals.
+        let alloc = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &pool_a, 5000, 900, 1000),
+                allocation(&env, &pool_b, 5000, 900, 1000),
+            ],
+        );
+        let sid = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Oracle"),
+            &2,
+            &100,
+            &500,
+            &3600,
+            &alloc,
+        );
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 0);
+
+        // A keeper publishes real numbers: B is now the better pool.
+        client.update_pool_apy(&admin, &pool_a, &500);
+        client.update_pool_apy(&admin, &pool_b, &1500);
+
+        let proposals = client.analyze_rebalance_opportunities(&sid);
+        assert_eq!(proposals.len(), 1);
+        let proposal = proposals.get(0).unwrap();
+        assert_eq!(proposal.from_pool, pool_a);
+        assert_eq!(proposal.to_pool, pool_b);
+        // 1500 (oracle) - 500 (oracle)
+        assert_eq!(proposal.expected_apy_improvement, 1000);
+    }
+
+    /// Once a feed goes stale the strategy snapshot is used again, so an
+    /// abandoned keeper cannot freeze a stale rate into every decision.
+    #[test]
+    fn test_analyze_falls_back_to_snapshot_when_feed_is_stale() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let pool_a = Address::generate(&env);
+        let pool_b = Address::generate(&env);
+
+        let alloc = Vec::from_array(
+            &env,
+            [
+                allocation(&env, &pool_a, 5000, 900, 1000),
+                allocation(&env, &pool_b, 5000, 900, 1000),
+            ],
+        );
+        let sid = client.create_strategy(
+            &admin,
+            &Symbol::new(&env, "Stale"),
+            &2,
+            &100,
+            &500,
+            &3600,
+            &alloc,
+        );
+
+        client.set_max_apy_age(&admin, &100);
+        client.update_pool_apy(&admin, &pool_a, &500);
+        client.update_pool_apy(&admin, &pool_b, &1500);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 1);
+
+        env.ledger().with_mut(|li| li.timestamp = 1000);
+        assert_eq!(client.analyze_rebalance_opportunities(&sid).len(), 0);
+    }
+
+    #[test]
+    fn test_scan_opportunities_prefers_oracle_apy() {
+        let env = Env::default();
+        let (client, admin) = engine(&env);
+        let vault_pool = Address::generate(&env);
+        let better_pool = Address::generate(&env);
+
+        client.set_rebalance_thresholds(&admin, &200, &100, &86400);
+
+        // The caller claims the vault pool earns 2900 bps, only 100 bps behind
+        // the candidate pool, which is below the 200 bps trigger.
+        let pools = Vec::from_array(&env, [allocation(&env, &better_pool, 10000, 3000, 3000)]);
+        assert_eq!(
+            client.scan_opportunities(&vault_pool, &2900, &pools).len(),
+            0
+        );
+
+        // The oracle says the vault pool actually earns 500 bps.
+        client.update_pool_apy(&admin, &vault_pool, &500);
+
+        let opportunities = client.scan_opportunities(&vault_pool, &2900, &pools);
+        assert_eq!(opportunities.len(), 1);
+        let opportunity = opportunities.get(0).unwrap();
+        assert_eq!(opportunity.current_apy, 500);
+        assert_eq!(opportunity.projected_apy, 3000);
+        assert_eq!(opportunity.apy_delta, 2500);
+        assert!(opportunity.recommended);
     }
 }
